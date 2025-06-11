@@ -10,15 +10,15 @@ import (
 	"strings"
 )
 
+// Safely handle internal server errors
 func internalServerError(w http.ResponseWriter, err error) {
 	if err != nil {
-		log.Printf("Internal server error: %v", err.Error())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Internal server error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 	}
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-
 	defer func() {
 		if err := recover(); err != nil {
 			log.Printf("WithHandler panic: %v", err)
@@ -26,86 +26,80 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	htmlProxy := os.Getenv("HTTP_PROXY_ENABLE") == "true"
-
-	// Set the CORS headers
+	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-PROXY-HOST, X-PROXY-SCHEME")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-	// Handle the OPTIONS preflight request
-	if r.Method == "OPTIONS" {
+	// Handle preflight
+	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Redirect to the GitHub repository
+	// Redirect root path
 	if r.URL.Path == "/" {
 		http.Redirect(w, r, "https://github.com/TBXark/vercel-proxy", http.StatusMovedPermanently)
 		return
 	}
 
-	// Get the URL to proxy
+	// Build the target URL from the path
 	re := regexp.MustCompile(`^/*(https?:)/*`)
-	u := re.ReplaceAllString(r.URL.Path, "$1//")
+	targetURL := re.ReplaceAllString(r.URL.Path, "$1//")
 	if r.URL.RawQuery != "" {
-		u += "?" + r.URL.RawQuery
+		targetURL += "?" + r.URL.RawQuery
 	}
-	if !strings.HasPrefix(u, "http") {
-		http.Error(w, "invalid url: "+u, http.StatusBadRequest)
+	if !strings.HasPrefix(targetURL, "http") {
+		http.Error(w, "invalid url: "+targetURL, http.StatusBadRequest)
 		return
 	}
 
-	// Create a new request
-	req, err := http.NewRequest(r.Method, u, r.Body)
+	// Create new outbound request
+	outReq, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
 		internalServerError(w, err)
 		return
 	}
+
+	// Only allow and forward safe headers
+	allowedHeaders := map[string]bool{
+		"Authorization": true,
+		"Content-Type":  true,
+		"User-Agent":    true,
+		"Accept":        true,
+	}
+
 	for k, v := range r.Header {
-		for _, vv := range v {
-			req.Header.Add(k, vv)
-		}
-	}
-	if htmlProxy && r.Header.Get("Accept-Encoding") != "" {
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			req.Header.Set("Accept-Encoding", "gzip")
+		if allowedHeaders[strings.Title(strings.ToLower(k))] {
+			for _, vv := range v {
+				outReq.Header.Add(k, vv)
+			}
 		}
 	}
 
-	// Send the request to the real server
-	resp, err := http.DefaultClient.Do(req)
+	// Ensure host is handled by the HTTP client
+	outReq.Host = ""
+
+	// Perform the HTTP request
+	client := &http.Client{}
+	resp, err := client.Do(outReq)
 	if err != nil {
 		internalServerError(w, err)
 		return
 	}
-	defer func(writer http.ResponseWriter, response *http.Response) {
-		internalServerError(writer, response.Body.Close())
-	}(w, resp)
+	defer resp.Body.Close()
 
-	if e := proxyRaw(w, resp, r); e != nil {
-		internalServerError(w, e)
-		return
-	}
-
-	w.WriteHeader(resp.StatusCode)
-}
-
-func proxyRaw(w http.ResponseWriter, resp *http.Response, req *http.Request) error {
+	// Copy response headers to client
 	for k, v := range resp.Header {
 		for _, vv := range v {
 			w.Header().Add(k, vv)
 		}
 	}
-	if w.Header().Get("Referer") != "" {
-		w.Header().Del("Referer")
-		w.Header().Add("Referer", req.Host)
-	}
 
-	// Copy the response body to the output stream
-	_, err := io.Copy(w, resp.Body)
+	// Set the response status code and body
+	w.WriteHeader(resp.StatusCode)
+	_, err = io.Copy(w, resp.Body)
 	if err != nil {
-		return err
+		internalServerError(w, err)
 	}
-	return nil
 }
