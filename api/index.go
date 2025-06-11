@@ -92,20 +92,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func proxyRaw(w http.ResponseWriter, resp *http.Response, req *http.Request) error {
-	// Clear and set only allowed headers
-	allowedHeaders := map[string]bool{
-		"Authorization":  true,
-		"Content-Type":   true,
-		"User-Agent":     true,
-		"Accept":         true,
-	}
-
-	for k, v := range r.Header {
-		if allowedHeaders[strings.Title(strings.ToLower(k))] {
-			for _, vv := range v {
-				req.Header.Add(k, vv)
-			}
+	for k, v := range resp.Header {
+		for _, vv := range v {
+			w.Header().Add(k, vv)
 		}
+	}
+	if w.Header().Get("Referer") != "" {
+		w.Header().Del("Referer")
+		w.Header().Add("Referer", req.Host)
 	}
 
 	// Copy the response body to the output stream
